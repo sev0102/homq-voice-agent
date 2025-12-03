@@ -160,6 +160,7 @@ app.post("/twilio", async (req, res) => {
         />
     </Response>`;
 
+    console.log("➡️ Sending TwiML (twilio):", xml); // FÜGE DIESE ZEILE HINZU
     res.type("text/xml").send(xml);
 });
 
@@ -209,6 +210,7 @@ app.post("/process", async (req, res) => {
             <Redirect>/twilio</Redirect>
         </Response>`;
 
+        console.log("➡️ Sending TwiML (process):", xml); // FÜGE DIESE ZEILE HINZU
         res.type("text/xml").send(xml);
 
     } catch (err) {
