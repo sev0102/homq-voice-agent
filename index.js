@@ -1,29 +1,24 @@
 //-------------------------------------------------------------
-// HOMQ – KLAUDI 5.0 PRODUCTION VERSION
-// Vollständig Base44-konform
-// 🔥 Nutzen ausschließlich Base44 Functions:
-//    - callerLookup  (Caller suchen/anlegen)
-//    - klaudiChat    (KI-Prompt)
-//    - ticketAiAgent (Tickets)
-//    - inboxAiAgent  (E-Mail Antworten)
-//    - googleCalendar (Termine)
-// 🔥 Nova Voice für Telefon
-// 🔥 Fehlerlos, keine Null-Zugriffe
+// HOMQ – KLAUDI 5.1 PRODUCTION VERSION
+// - Richtige TTS Engine (tts-1)
+// - Voll Base44-konform
+// - callerLookup + callerUpdate
+// - klaudiChat über Base44 Prompt
+// - Audio-Fallbacks
+// - Null-sicher, keine Abstürze
 //-------------------------------------------------------------
 
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import fetch from "node-fetch";
+
 dotenv.config();
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ------------------------------------------------------------
-// CONFIG
-// ------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 const BASE44_URL = process.env.BASE44_URL;
 const BASE44_KEY = process.env.BASE44_API_KEY;
@@ -36,11 +31,11 @@ const openai = new OpenAI({
 });
 
 // ------------------------------------------------------------
-// HELFER: Base44 Function Call
+// BASE44 FUNCTION CALL WRAPPER
 // ------------------------------------------------------------
-async function base44Function(functionName, payload = {}) {
+async function base44Function(fnName, payload = {}) {
     try {
-        const res = await fetch(`${BASE44_URL}/api/functions/${functionName}`, {
+        const res = await fetch(`${BASE44_URL}/api/functions/${fnName}`, {
             method: "POST",
             headers: {
                 "Authorization": `Bearer ${BASE44_KEY}`,
@@ -50,62 +45,74 @@ async function base44Function(functionName, payload = {}) {
         });
 
         if (!res.ok) {
-            console.error(`❌ Base44 Function Error: ${functionName}`, await res.text());
+            console.error(`❌ Base44 '${fnName}' Error:`, await res.text());
             return null;
         }
 
         return res.json();
     } catch (err) {
-        console.error(`❌ Base44 Function FAILED: ${functionName}`, err);
+        console.error(`❌ Base44 '${fnName}' FAILED:`, err);
         return null;
     }
 }
 
 // ------------------------------------------------------------
-// CALLER MANAGEMENT über Base44 Funktion callerLookup
+// CALLER SYSTEM: callerLookup → callerUpdate
 // ------------------------------------------------------------
 async function getOrCreateCaller(phone) {
-    const response = await base44Function("callerLookup", { phone });
+    const result = await base44Function("callerLookup", { phone });
 
-    if (!response || !response.caller) {
-        console.error("❌ Konnte Caller nicht laden oder erstellen");
+    if (!result || !result.caller) {
+        console.error("❌ callerLookup returned null");
         return null;
     }
 
-    console.log("📞 Caller geladen:", response.caller.phone);
-    return response.caller;
+    console.log("📞 Caller geladen:", result.caller.phone);
+    return result.caller;
 }
 
 // ------------------------------------------------------------
-// TTS – Nova Voice Ausgabe
+// TTS – Nova Stimme mit richtigem Modell (tts-1) + Logging
 // ------------------------------------------------------------
 async function speak(text) {
-    const audio = await openai.audio.speech.create({
-        model: "gpt-4o-mini-tts",
-        voice: "nova",
-        speed: 0.94,
-        input: text
-    });
+    try {
+        console.log("🗣️ TTS Input:", text);
 
-    return Buffer.from(await audio.arrayBuffer()).toString("base64");
+        const audio = await openai.audio.speech.create({
+            model: "tts-1",
+            voice: "nova",
+            speed: 0.93,
+            input: text
+        });
+
+        const buffer = Buffer.from(await audio.arrayBuffer());
+        const base64 = buffer.toString("base64");
+
+        console.log("🔊 Generated Audio (start):", base64.substring(0, 50) + "...");
+
+        return base64;
+    } catch (err) {
+        console.error("❌ TTS speak error:", err);
+        return null;
+    }
 }
 
 // ------------------------------------------------------------
-// KI – klaudiChat über Base44 Prompt
+// ASK KLAUDI (prompt läuft über Base44)
 // ------------------------------------------------------------
 async function askKlaudi(caller, transcript) {
-    console.log("🤖 Frage an Klaudi:", transcript);
+    console.log("🤖 Query to klaudiChat:", transcript);
 
-    const response = await base44Function("klaudiChat", {
+    const result = await base44Function("klaudiChat", {
         caller,
         message: transcript
     });
 
-    if (!response || !response.reply) {
-        return "Ich konnte das nicht vollständig verstehen. Kannst du das bitte wiederholen?";
+    if (!result || !result.reply) {
+        return "Ich habe dich nicht ganz verstanden. Kannst du das bitte wiederholen?";
     }
 
-    return response.reply;
+    return result.reply;
 }
 
 // ------------------------------------------------------------
@@ -113,7 +120,6 @@ async function askKlaudi(caller, transcript) {
 // ------------------------------------------------------------
 app.post("/twilio", async (req, res) => {
     const phone = req.body.From;
-
     const caller = await getOrCreateCaller(phone);
 
     let greeting = "Hallo, ich bin Klaudi von HOMQ. Wie kann ich dir helfen?";
@@ -124,7 +130,16 @@ app.post("/twilio", async (req, res) => {
         greeting = "Hallo, ich bin Klaudi von HOMQ. Wie darf ich dich nennen?";
     }
 
-    const voice = await speak(greeting);
+    let voice = await speak(greeting);
+
+    if (!voice) {
+        console.error("❌ Konnte Begrüßung nicht generieren");
+        return res.type("text/xml").send(`
+        <Response>
+            <Say voice="alice">Hallo, ich bin Klaudi von HOMQ.</Say>
+            <Redirect>/twilio</Redirect>
+        </Response>`);
+    }
 
     const xml = `
     <Response>
@@ -141,38 +156,44 @@ app.post("/twilio", async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// SPRACHE VERARBEITEN
+// SPRACHAUFSAGE VERARBEITEN
 // ------------------------------------------------------------
 app.post("/process", async (req, res) => {
     try {
         const phone = req.body.From;
         const audioUrl = req.body.RecordingUrl + ".wav";
 
-        // 1) TRANSKRIPT
+        console.log("🎧 Audio URL:", audioUrl);
+
         const transcript = await openai.audio.transcriptions.create({
             model: "gpt-4o-mini-transcribe",
             file: audioUrl,
             response_format: "text"
         });
 
-        console.log("📝 Nutzer sagt:", transcript);
+        console.log("📝 Transcript:", transcript);
 
-        // 2) CALLER LADEN
         const caller = await getOrCreateCaller(phone);
 
-        // Falls Name unbekannt → Name speichern
-        if (caller && !caller.name && transcript.length < 30) {
+        // Name speichern, falls leer & kurz
+        if (caller && !caller.name && transcript.length < 25) {
             await base44Function("callerUpdate", {
                 id: caller.id,
                 name: transcript.trim()
             });
         }
 
-        // 3) KLAUDI ANTWORT
         const reply = await askKlaudi(caller, transcript);
 
-        // 4) SPRECHEN
-        const voice = await speak(reply);
+        let voice = await speak(reply);
+
+        if (!voice) {
+            return res.type("text/xml").send(`
+            <Response>
+                <Say voice="alice">Entschuldigung, ich konnte keine Antwort generieren.</Say>
+                <Redirect>/twilio</Redirect>
+            </Response>`);
+        }
 
         const xml = `
         <Response>
@@ -183,14 +204,13 @@ app.post("/process", async (req, res) => {
         res.type("text/xml").send(xml);
 
     } catch (err) {
-        console.error("❌ PROCESS ERROR:", err);
+        console.error("❌ Prozessfehler:", err);
 
-        res.type("text/xml").send(`
+        return res.type("text/xml").send(`
         <Response>
-            <Say>Entschuldigung, ich konnte das nicht verstehen.</Say>
+            <Say voice="alice">Entschuldigung, da ging etwas schief.</Say>
             <Redirect>/twilio</Redirect>
-        </Response>
-        `);
+        </Response>`);
     }
 });
 
@@ -198,5 +218,5 @@ app.post("/process", async (req, res) => {
 // SERVER
 // ------------------------------------------------------------
 app.listen(PORT, () => {
-    console.log(`🚀 KLAUDI 5.0 Voice Agent läuft auf Port ${PORT}`);
+    console.log(`🚀 KLAUDI 5.1 Voice Agent läuft auf Port ${PORT}`);
 });
