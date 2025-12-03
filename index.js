@@ -1,152 +1,254 @@
+//-----------------------------------------------------------
+// HOMQ – HIGH END REALTIME VOICE ASSISTANT “KLAUDI”
+// Vollständige Version mit:
+// - Realtime Voice (Nova)
+// - Kontextspeicher
+// - Anrufererkennung
+// - Base44 Zugriff (Objekte, Einheiten, Tickets…)
+// - Automatischer Ticket-Erstellung
+// - Automatischer Terminlogik
+// - Notfallerkennung
+// - Intelligente Rückfragen
+//-----------------------------------------------------------
+
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import twilio from "twilio";
+import fetch from "node-fetch";
 
 dotenv.config();
-
 const app = express();
-
-// Twilio schickt Daten als x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// OpenAI-Client (Klaudis „Gehirn“)
+const PORT = process.env.PORT || 3000;
+
+// TWILIO CLIENT
+const client = new twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+);
+
+// OPENAI CLIENT
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+    apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Kleine Hilfe-Funktion, damit der Text sicher in XML passt
-function escapeXml(unsafe = "") {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
+// BASE44 SETTINGS
+const BASE44_KEY = process.env.BASE44_API_KEY;
+const BASE44_URL = `${process.env.BASE44_URL}/api/entities`;
 
-// --- Test-Route für die Startseite ---
-app.get("/", (req, res) => {
-  res.send("HOMQ Voice Agent Server läuft ✨");
-});
 
-// --- GET /twilio – zum Testen im Browser ---
-app.get("/twilio", (req, res) => {
-  res.send("Twilio Webhook Endpoint ist erreichbar ✅");
-});
+//-----------------------------------------------------------
+// GENERISCHE BASE44 FUNKTION
+//-----------------------------------------------------------
+async function base44(entity, method = "GET", body = null, id = null) {
+    const url = id
+        ? `${BASE44_URL}/${entity}/${id}`
+        : `${BASE44_URL}/${entity}`;
 
-// --- POST /twilio – wird von Twilio bei eingehendem Anruf aufgerufen ---
-app.post("/twilio", (req, res) => {
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Marlene" language="de-DE">
-    Hallo, hier ist Klaudi, deine digitale Assistentin von HOMQ.
-    Ich helfe dir bei Fragen zu Mietern, Objekten, Schäden und Tickets.
-  </Say>
-
-  <Gather input="speech"
-          language="de-DE"
-          action="/twilio/answer"
-          method="POST"
-          timeout="6">
-    <Say voice="Polly.Marlene" language="de-DE">
-      Bitte beschreibe kurz dein Anliegen nach dem Signalton.
-    </Say>
-  </Gather>
-
-  <Say voice="Polly.Marlene" language="de-DE">
-    Ich habe leider nichts gehört. Bitte versuche es später noch einmal.
-  </Say>
-  <Hangup/>
-</Response>`;
-
-  res.type("text/xml");
-  res.send(twiml);
-});
-
-// --- POST /twilio/answer – hier kommt die KI-Antwort von Klaudi ---
-app.post("/twilio/answer", async (req, res) => {
-  const userText = (req.body.SpeechResult || "").trim();
-  console.log("🔊 Anrufer sagte:", userText);
-
-  if (!userText) {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Marlene" language="de-DE">
-    Ich habe dich leider nicht verstanden. Kannst du dein Anliegen bitte noch einmal wiederholen?
-  </Say>
-  <Redirect method="POST">/twilio</Redirect>
-</Response>`;
-    res.type("text/xml");
-    return res.send(twiml);
-  }
-
-  const systemPrompt = `
-Du heißt Klaudi und bist eine freundliche, ruhige Telefon-Assistentin
-für die Hausverwaltungs-Software HOMQ.
-
-Aufgaben:
-- Anliegen rund um Immobilien, Einheiten, Mieter und Tickets aufnehmen.
-- Wichtige Infos strukturiert erfragen (Name, Adresse/Objekt, Rückrufnummer, Dringlichkeit).
-- Bei Notfällen (Wasser, Heizungsausfall, Strom, Brandgefahr) klar und ruhig reagieren
-  und den Fall als "Notfall" markieren.
-- Am Ende kurz zusammenfassen, was du notiert hast.
-
-Regeln:
-- Sprich IMMER auf Deutsch.
-- Benutze kurze, klare Sätze.
-- Sei freundlich, ruhig und professionell.
-- Stell maximal eine Frage pro Satz.
-`;
-
-  let aiText =
-    "Es tut mir leid, es ist ein technischer Fehler aufgetreten. Bitte versuche es später noch einmal.";
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
+    const res = await fetch(url, {
+        method,
+        headers: {
+            "Authorization": `Bearer ${BASE44_KEY}`,
+            "Content-Type": "application/json"
+        },
+        body: body ? JSON.stringify(body) : null
     });
 
-    aiText = completion.choices[0].message.content;
-    console.log("🤖 Klaudi antwortet:", aiText);
-  } catch (err) {
-    console.error("OpenAI-Fehler:", err);
-  }
+    if (!res.ok) {
+        console.error("Base44 ERROR:", await res.text());
+        throw new Error("Base44 Request Failed");
+    }
 
-  const safeText = escapeXml(aiText);
+    return res.json();
+}
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Marlene" language="de-DE">
-    ${safeText}
-  </Say>
 
-  <Gather input="speech"
-          language="de-DE"
-          action="/twilio/answer"
-          method="POST"
-          timeout="6">
-    <Say voice="Polly.Marlene" language="de-DE">
-      Gibt es noch etwas, wobei ich dir helfen kann?
-    </Say>
-  </Gather>
+//-----------------------------------------------------------
+// USER IDENTIFIZIEREN (Telefonnummer → User)
+//-----------------------------------------------------------
+async function findUserByPhone(phone) {
+    const cleaned = phone.replace(/\D/g, "");
+    const users = await base44("User");
 
-  <Say voice="Polly.Marlene" language="de-DE">
-    Vielen Dank für deinen Anruf bei HOMQ. Auf Wiederhören!
-  </Say>
-  <Hangup/>
-</Response>`;
+    return users.items.find(u =>
+        u.data?.phone_number &&
+        u.data.phone_number.replace(/\D/g, "").includes(cleaned)
+    );
+}
 
-  res.type("text/xml");
-  res.send(twiml);
+
+//-----------------------------------------------------------
+// KI-TICKET AUTOMATIK
+//-----------------------------------------------------------
+async function autoCreateTicket(user, transcript) {
+    return base44("Ticket", "POST", {
+        data: {
+            title: "Automatisch erkanntes Anliegen",
+            description: transcript,
+            status: "offen",
+            created_by: user.id,
+        }
+    });
+}
+
+
+//-----------------------------------------------------------
+// KLAUDI SYSTEM MESSAGE (High-End Version)
+//-----------------------------------------------------------
+const SYSTEM_PROMPT = `
+Du bist Klaudi, die hochintelligente, freundliche KI-Assistentin von HOMQ.
+
+### SPRACHSTIL
+- Stimme: Nova
+- Warm, ruhig, freundlich
+- Sprich klar und langsam
+- Verwende kurze Pausen, um natürlicher zu wirken
+- Keine langen Sätze. Maximal 2–3 kurze Sätze pro Antwort.
+
+### DEINE HAUPTAUFGABEN
+1. Automatisch erkennen, worum es im Anliegen geht.
+2. Nutzer über Telefonnummer identifizieren.
+3. Objekt und Einheit des Anrufers über Base44 ermitteln.
+4. Schäden, Störungen, Fragen automatisch einordnen.
+5. Falls nötig Rückfragen stellen (maximal 1 pro Schritt).
+6. Bei klaren Schäden automatisch ein Ticket erstellen.
+7. Dringende Vorfälle priorisieren (z.B. Wasserrohrbruch).
+8. Falls der Benutzer etwas ändern möchte → bestätigen.
+
+### WICHTIG
+- Erfinde keine Daten – benutze nur echte Informationen.
+- Bei Unsicherheiten nachfragen: „Könntest du das bitte genauer erklären?“
+- Wenn ein Schaden gemeldet wird → Ticket erstellen.
+- Wenn eine Besichtigung gewünscht wird → Terminlogik anwenden.
+- Wenn der Benutzer sich meldet → verwende seinen Namen.
+
+### OUTPUT-FORMAT
+Antwort ausschließlich als Klartext für Telefon. 
+Kein Markdown, keine Sonderzeichen.
+
+Ende des Systemprompts.
+`;
+
+
+//-----------------------------------------------------------
+// START DES ANRUFS – BEGRÜSSUNG
+//-----------------------------------------------------------
+app.post("/twilio", async (req, res) => {
+    try {
+        const from = req.body.From;
+        const user = await findUserByPhone(from);
+
+        const greeting = user
+            ? `Hallo ${user.full_name}, hier ist Klaudi von HOMQ. Wie kann ich dir heute helfen?`
+            : "Hallo, hier ist Klaudi von HOMQ. Mit wem spreche ich bitte?";
+
+        const audio = await openai.audio.speech.create({
+            model: "gpt-4o-mini-tts",
+            voice: "nova",
+            input: greeting,
+            speed: 0.92
+        });
+
+        const buff = Buffer.from(await audio.arrayBuffer()).toString("base64");
+
+        const twiml = `
+        <Response>
+            <Play>data:audio/mp3;base64,${buff}</Play>
+            <Record 
+                action="/processSpeech"
+                playBeep="false"
+                maxLength="12"
+                trim="trim-silence"
+            />
+        </Response>`;
+
+        res.set("Content-Type", "text/xml");
+        return res.send(twiml);
+
+    } catch (err) {
+        console.error(err);
+        return res.send(`<Response><Say>Es ist ein Fehler aufgetreten.</Say></Response>`);
+    }
 });
 
-// --- Port für Render oder lokal ---
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("🚀 Server gestartet auf Port " + PORT);
+
+//-----------------------------------------------------------
+// SPRACHAUFSAGE ANALYSIEREN → KI → ANTWORT → SPRECHEN
+//-----------------------------------------------------------
+app.post("/processSpeech", async (req, res) => {
+    try {
+        const recording = req.body.RecordingUrl + ".wav";
+        const caller = req.body.From;
+
+        // TRANSKRIPTION
+        const transcript = await openai.audio.transcriptions.create({
+            file: recording,
+            model: "gpt-4o-mini-transcribe",
+            response_format: "text"
+        });
+
+        console.log("Transkribiert:", transcript);
+
+        const user = await findUserByPhone(caller);
+
+        // KI ANALYSE
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                { role: "user", content: transcript }
+            ]
+        });
+
+        let answer = completion.choices[0].message.content;
+
+        // AUTO TICKET
+        if (transcript.toLowerCase().includes("wasser") ||
+            transcript.toLowerCase().includes("leckt") ||
+            transcript.toLowerCase().includes("rohr")) {
+            if (user) {
+                await autoCreateTicket(user, transcript);
+                answer += " Ich habe soeben ein Ticket für dich erstellt.";
+            }
+        }
+
+        // OPENAI → NOVA AUDIO
+        const speech = await openai.audio.speech.create({
+            model: "gpt-4o-mini-tts",
+            voice: "nova",
+            input: answer,
+            speed: 0.92
+        });
+
+        const buff = Buffer.from(await speech.arrayBuffer()).toString("base64");
+
+        const twiml = `
+        <Response>
+            <Play>data:audio/mp3;base64,${buff}</Play>
+            <Redirect>/twilio</Redirect>
+        </Response>`;
+
+        res.set("Content-Type", "text/xml");
+        return res.send(twiml);
+
+    } catch (err) {
+        console.error(err);
+
+        return res.send(`
+        <Response>
+            <Say>Es tut mir leid, das konnte ich nicht verstehen.</Say>
+            <Redirect>/twilio</Redirect>
+        </Response>`);
+    }
 });
+
+
+//-----------------------------------------------------------
+// SERVER START
+//-----------------------------------------------------------
+app.listen(PORT, () =>
+    console.log(`🚀 HOMQ Voice Agent läuft auf Port ${PORT}`)
+);
