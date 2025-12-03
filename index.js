@@ -72,7 +72,7 @@ async function getOrCreateCaller(phone) {
 }
 
 // ------------------------------------------------------------
-// TTS – Nova Stimme mit richtigem Modell (tts-1) + Logging
+// TTS – Nova Stimme + Upload zu Base44 für öffentliche URL
 // ------------------------------------------------------------
 async function speak(text) {
     try {
@@ -88,39 +88,23 @@ async function speak(text) {
         const buffer = Buffer.from(await audio.arrayBuffer());
         const base64 = buffer.toString("base64");
 
-        console.log("🔊 Generated Audio (start):", base64.substring(0, 50) + "...");
-        console.log("🔊 Generated Audio length:", base64.length); // NEUE ZEILE: Länge des Base64-Strings loggen
+        console.log("🔊 Generated Audio length:", base64.length);
 
-        if (base64.length === 0) { // NEUE PRÜFUNG: Wenn Base64-String leer ist
-            console.error("❌ Generated Base64 audio is empty, returning null.");
+        // Audio zu Base44 hochladen und URL erhalten
+        const uploadResult = await base44Function("uploadAudio", { audioBase64: base64 });
+
+        if (!uploadResult || !uploadResult.file_url) {
+            console.error("❌ Audio upload failed");
             return null;
         }
 
-        return base64;
+        console.log("✅ Audio URL:", uploadResult.file_url);
+        return uploadResult.file_url; // Jetzt wird eine URL zurückgegeben!
+
     } catch (err) {
         console.error("❌ TTS speak error:", err);
         return null;
     }
-}
-
-// ... keep existing code ...
-
-// ------------------------------------------------------------
-// ASK KLAUDI (prompt läuft über Base44)
-// ------------------------------------------------------------
-async function askKlaudi(caller, transcript) {
-    console.log("🤖 Query to klaudiChat:", transcript);
-
-    const result = await base44Function("klaudiChat", {
-        caller,
-        message: transcript
-    });
-
-    if (!result || !result.reply) {
-        return "Ich habe dich nicht ganz verstanden. Kannst du das bitte wiederholen?";
-    }
-
-    return result.reply;
 }
 
 // ------------------------------------------------------------
@@ -151,7 +135,7 @@ app.post("/twilio", async (req, res) => {
 
     const xml = `
     <Response>
-        <Play>data:audio/mp3;base64,${voice}</Play>
+        <Play>${voice}</Play>
         <Record 
             action="/process"
             playBeep="false"
@@ -206,7 +190,7 @@ app.post("/process", async (req, res) => {
 
         const xml = `
         <Response>
-            <Play>data:audio/mp3;base64,${voice}</Play>
+            <Play>${voice}</Play>
             <Redirect>/twilio</Redirect>
         </Response>`;
 
