@@ -30,7 +30,7 @@ app.post("/twilio", (req, res) => {
 });
 
 // Port von Render oder lokal 3000
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
   console.log("🚀 Server gestartet auf Port " + PORT);
