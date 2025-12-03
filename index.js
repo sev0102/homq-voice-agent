@@ -89,6 +89,12 @@ async function speak(text) {
         const base64 = buffer.toString("base64");
 
         console.log("🔊 Generated Audio (start):", base64.substring(0, 50) + "...");
+        console.log("🔊 Generated Audio length:", base64.length); // NEUE ZEILE: Länge des Base64-Strings loggen
+
+        if (base64.length === 0) { // NEUE PRÜFUNG: Wenn Base64-String leer ist
+            console.error("❌ Generated Base64 audio is empty, returning null.");
+            return null;
+        }
 
         return base64;
     } catch (err) {
@@ -96,6 +102,8 @@ async function speak(text) {
         return null;
     }
 }
+
+// ... keep existing code ...
 
 // ------------------------------------------------------------
 // ASK KLAUDI (prompt läuft über Base44)
