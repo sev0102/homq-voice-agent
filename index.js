@@ -5,135 +5,148 @@ import OpenAI from "openai";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
+// Twilio schickt Daten als x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+
+// OpenAI-Client (Klaudis „Gehirn“)
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Test-Route für die Startseite
+// Kleine Hilfe-Funktion, damit der Text sicher in XML passt
+function escapeXml(unsafe = "") {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// --- Test-Route für die Startseite ---
 app.get("/", (req, res) => {
-  res.send("HOMIQ Voice Agent Server läuft ✨");
+  res.send("HOMQ Voice Agent Server läuft ✨");
 });
 
-// GET /twilio – damit du im Browser testen kannst
+// --- GET /twilio – zum Testen im Browser ---
 app.get("/twilio", (req, res) => {
-  res.send("Twilio Webhook Endpoint ist erreichbar ✔️");
+  res.send("Twilio Webhook Endpoint ist erreichbar ✅");
 });
 
-// Einstieg: Anruf kommt rein → Klaudi begrüßt und wartet auf Sprache
+// --- POST /twilio – wird von Twilio bei eingehendem Anruf aufgerufen ---
 app.post("/twilio", (req, res) => {
-  console.log("📞 Eingehender Anruf bei HOMQ – Klaudi wird aktiviert");
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Marlene" language="de-DE">
+    Hallo, hier ist Klaudi, deine digitale Assistentin von HOMQ.
+    Ich helfe dir bei Fragen zu Mietern, Objekten, Schäden und Tickets.
+  </Say>
 
-  const twiml = `
-    <Response>
-      <Say voice="Polly.Vicki" language="de-DE">
-        Willkommen bei HOMQ. Du sprichst mit Klaudi, deiner digitalen Assistentin.
-        Bitte beschreibe in einem Satz, wobei ich dir helfen kann.
-      </Say>
-      <Gather input="speech" action="/twilio/process" method="POST" language="de-DE" speechTimeout="auto">
-        <Say voice="Polly.Vicki" language="de-DE">
-          Ich höre zu.
-        </Say>
-      </Gather>
-      <Say voice="Polly.Vicki" language="de-DE">
-        Ich habe leider nichts verstanden. Bitte ruf gerne nochmal an.
-      </Say>
-      <Hangup/>
-    </Response>
-  `;
+  <Gather input="speech"
+          language="de-DE"
+          action="/twilio/answer"
+          method="POST"
+          timeout="6">
+    <Say voice="Polly.Marlene" language="de-DE">
+      Bitte beschreibe kurz dein Anliegen nach dem Signalton.
+    </Say>
+  </Gather>
+
+  <Say voice="Polly.Marlene" language="de-DE">
+    Ich habe leider nichts gehört. Bitte versuche es später noch einmal.
+  </Say>
+  <Hangup/>
+</Response>`;
 
   res.type("text/xml");
   res.send(twiml);
 });
 
-// Verarbeitung: Twilio hat Sprache in Text umgewandelt → GPT antwortet
-app.post("/twilio/process", async (req, res) => {
+// --- POST /twilio/answer – hier kommt die KI-Antwort von Klaudi ---
+app.post("/twilio/answer", async (req, res) => {
+  const userText = (req.body.SpeechResult || "").trim();
+  console.log("🔊 Anrufer sagte:", userText);
+
+  if (!userText) {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Marlene" language="de-DE">
+    Ich habe dich leider nicht verstanden. Kannst du dein Anliegen bitte noch einmal wiederholen?
+  </Say>
+  <Redirect method="POST">/twilio</Redirect>
+</Response>`;
+    res.type("text/xml");
+    return res.send(twiml);
+  }
+
+  const systemPrompt = `
+Du heißt Klaudi und bist eine freundliche, ruhige Telefon-Assistentin
+für die Hausverwaltungs-Software HOMQ.
+
+Aufgaben:
+- Anliegen rund um Immobilien, Einheiten, Mieter und Tickets aufnehmen.
+- Wichtige Infos strukturiert erfragen (Name, Adresse/Objekt, Rückrufnummer, Dringlichkeit).
+- Bei Notfällen (Wasser, Heizungsausfall, Strom, Brandgefahr) klar und ruhig reagieren
+  und den Fall als "Notfall" markieren.
+- Am Ende kurz zusammenfassen, was du notiert hast.
+
+Regeln:
+- Sprich IMMER auf Deutsch.
+- Benutze kurze, klare Sätze.
+- Sei freundlich, ruhig und professionell.
+- Stell maximal eine Frage pro Satz.
+`;
+
+  let aiText =
+    "Es tut mir leid, es ist ein technischer Fehler aufgetreten. Bitte versuche es später noch einmal.";
+
   try {
-    const userText = req.body.SpeechResult || "";
-    console.log("🗣️ Anrufer sagte:", userText);
-
-    if (!userText) {
-      const fallback = `
-        <Response>
-          <Say voice="Polly.Vicki" language="de-DE">
-            Entschuldigung, ich habe nichts verstanden. Bitte versuch es noch einmal.
-          </Say>
-          <Redirect method="POST">/twilio</Redirect>
-        </Response>
-      `;
-      res.type("text/xml");
-      return res.send(fallback);
-    }
-
-    // OpenAI: Klaudi generiert eine Antwort
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4.1-mini",
       messages: [
-        {
-          role: "system",
-          content: `
-Du bist Klaudi, die freundliche digitale Assistentin von HOMQ, einer modernen Hausverwaltungs-Plattform.
-Sprich langsam, klar und in kurzen Sätzen. Du hilfst Mietern, Eigentümern und Verwaltern bei Fragen
-zu Reparaturen, Schäden, Zahlungen, Dokumenten, Mietverträgen und Terminen.
-Formuliere deine Antworten so, dass sie in der Telefonleitung gut verständlich sind.
-          `.trim(),
-        },
-        {
-          role: "user",
-          content: userText,
-        },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userText },
       ],
-      max_tokens: 180,
     });
 
-    const aiAnswer =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "Entschuldigung, ich konnte deine Anfrage nicht verarbeiten.";
-
-    console.log("🤖 Klaudi antwortet:", aiAnswer);
-
-    // Antwort an Twilio zurückgeben – wird am Telefon vorgelesen
-    const twiml = `
-      <Response>
-        <Say voice="Polly.Vicki" language="de-DE">
-          ${aiAnswer}
-        </Say>
-        <Say voice="Polly.Vicki" language="de-DE">
-          Möchtest du noch etwas fragen? Bitte antworte nach dem Signalton.
-        </Say>
-        <Gather input="speech" action="/twilio/process" method="POST" language="de-DE" speechTimeout="auto">
-          <Say voice="Polly.Vicki" language="de-DE">
-            Ich höre zu.
-          </Say>
-        </Gather>
-      </Response>
-    `;
-
-    res.type("text/xml");
-    res.send(twiml);
+    aiText = completion.choices[0].message.content;
+    console.log("🤖 Klaudi antwortet:", aiText);
   } catch (err) {
-    console.error("❌ Fehler in /twilio/process:", err);
-
-    const errorTwiml = `
-      <Response>
-        <Say voice="Polly.Vicki" language="de-DE">
-          Entschuldigung, es ist ein technischer Fehler aufgetreten.
-          Bitte versuche es später noch einmal.
-        </Say>
-        <Hangup/>
-      </Response>
-    `;
-    res.type("text/xml");
-    res.send(errorTwiml);
+    console.error("OpenAI-Fehler:", err);
   }
+
+  const safeText = escapeXml(aiText);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Marlene" language="de-DE">
+    ${safeText}
+  </Say>
+
+  <Gather input="speech"
+          language="de-DE"
+          action="/twilio/answer"
+          method="POST"
+          timeout="6">
+    <Say voice="Polly.Marlene" language="de-DE">
+      Gibt es noch etwas, wobei ich dir helfen kann?
+    </Say>
+  </Gather>
+
+  <Say voice="Polly.Marlene" language="de-DE">
+    Vielen Dank für deinen Anruf bei HOMQ. Auf Wiederhören!
+  </Say>
+  <Hangup/>
+</Response>`;
+
+  res.type("text/xml");
+  res.send(twiml);
 });
 
-
-// Port von Render oder lokal 3000
+// --- Port für Render oder lokal ---
 const PORT = process.env.PORT || 10000;
-
 app.listen(PORT, () => {
   console.log("🚀 Server gestartet auf Port " + PORT);
 });
