@@ -66,17 +66,41 @@ async function base44(entity, method = "GET", body = null, id = null) {
 }
 
 
-//-----------------------------------------------------------
-// USER IDENTIFIZIEREN (Telefonnummer → User)
-//-----------------------------------------------------------
-async function findUserByPhone(phone) {
-    const cleaned = phone.replace(/\D/g, "");
-    const users = await base44("User");
+// --- BASE44 API: Benutzer anhand Telefonnummer finden -----------------
+async function findUserByPhone(phoneNumber) {
+    try {
+        console.log("🔍 Suche Benutzer in Base44 mit Nummer:", phoneNumber);
 
-    return users.items.find(u =>
-        u.data?.phone_number &&
-        u.data.phone_number.replace(/\D/g, "").includes(cleaned)
-    );
+        const url = `${process.env.BASE44_URL}/api/entities/User?where=${encodeURIComponent(JSON.stringify({
+            phone_number: phoneNumber
+        }))}`;
+
+        const response = await fetch(url, {
+            method: "GET",
+            headers: {
+                "Authorization": `Bearer ${process.env.BASE44_API_KEY}`,
+                "Content-Type": "application/json"
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Base44 request failed (${response.status})`);
+        }
+
+        const data = await response.json();
+
+        if (!data || data.length === 0) {
+            console.log("❌ Kein Benutzer gefunden");
+            return null;
+        }
+
+        console.log("✅ Benutzer gefunden:", data[0]);
+        return data[0];
+
+    } catch (err) {
+        console.error("❌ Fehler in findUserByPhone:", err);
+        return null;
+    }
 }
 
 
