@@ -1,17 +1,16 @@
 //-------------------------------------------------------------
-// HOMQ – KLAUDI 5.1 PRODUCTION VERSION
-// - Richtige TTS Engine (tts-1)
-// - Voll Base44-konform
-// - callerLookup + callerUpdate
-// - klaudiChat über Base44 Prompt
-// - Audio-Fallbacks
-// - Null-sicher, keine Abstürze
+// HOMQ – KLAUDI 6.0 CLEAN VERSION
+// - OpenAI TTS (tts-1, voice "nova")
+// - Audio-Hosting direkt auf Render (/audio/:id.mp3)
+// - Base44: callerLookup, callerUpdate, klaudiChat
+// - Twilio: /twilio (Einstieg) + /process (Antworten)
 //-------------------------------------------------------------
 
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -19,9 +18,17 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// ------------------------------------------------------------
+// CONFIG
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 const BASE44_URL = process.env.BASE44_URL;
 const BASE44_KEY = process.env.BASE44_API_KEY;
+const PUBLIC_BASE_URL =
+    process.env.PUBLIC_BASE_URL || `https://homiq-voice-agent.onrender.com`;
+
+// In-Memory Store für generierte Audiofiles
+const audioStore = new Map();
 
 // ------------------------------------------------------------
 // OPENAI CLIENT
@@ -38,10 +45,10 @@ async function base44Function(fnName, payload = {}) {
         const res = await fetch(`${BASE44_URL}/api/functions/${fnName}`, {
             method: "POST",
             headers: {
-                "Authorization": `Bearer ${BASE44_KEY}`,
-                "Content-Type": "application/json"
+                Authorization: `Bearer ${BASE44_KEY}`,
+                "Content-Type": "application/json",
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
         });
 
         if (!res.ok) {
@@ -72,9 +79,34 @@ async function getOrCreateCaller(phone) {
 }
 
 // ------------------------------------------------------------
-// TTS – Nova Stimme + Upload zu Base44 für öffentliche URL
+// KLAUDI CHAT – Logik aus Base44
 // ------------------------------------------------------------
-async function speak(text) {
+async function askKlaudi(caller, transcript) {
+    try {
+        const payload = {
+            caller: caller || null,
+            message: transcript,
+        };
+
+        const result = await base44Function("klaudiChat", payload);
+
+        if (!result) {
+            console.error("❌ klaudiChat: kein Ergebnis");
+            return "Entschuldigung, ich konnte gerade nichts Sinnvolles antworten.";
+        }
+
+        // Falls deine Base44-Funktion anders zurückgibt, hier anpassen:
+        return result.reply || result.text || String(result);
+    } catch (err) {
+        console.error("❌ askKlaudi Fehler:", err);
+        return "Entschuldigung, da ist gerade ein Fehler passiert.";
+    }
+}
+
+// ------------------------------------------------------------
+// TTS – Nova Stimme → MP3 → eigene URL für Twilio
+// ------------------------------------------------------------
+async function speakToUrl(text) {
     try {
         console.log("🗣️ TTS Input:", text);
 
@@ -82,39 +114,63 @@ async function speak(text) {
             model: "tts-1",
             voice: "nova",
             speed: 0.93,
-            input: text
+            input: text,
+            // format: "mp3"  // mp3 ist Default; kann man explizit setzen
         });
 
         const buffer = Buffer.from(await audio.arrayBuffer());
-        const base64 = buffer.toString("base64");
+        console.log("🔊 Generated Audio bytes:", buffer.length);
 
-        console.log("🔊 Generated Audio length:", base64.length);
+        const id = crypto.randomUUID();
+        audioStore.set(id, buffer);
 
-        // Audio zu Base44 hochladen und URL erhalten
-        const uploadResult = await base44Function("uploadAudio", { audioBase64: base64 });
+        const url = `${PUBLIC_BASE_URL}/audio/${id}.mp3`;
+        console.log("✅ Local Audio URL für Twilio:", url);
 
-        if (!uploadResult || !uploadResult.file_url) {
-            console.error("❌ Audio upload failed");
-            return null;
-        }
-
-        console.log("✅ Audio URL:", uploadResult.file_url);
-        return uploadResult.file_url; // Jetzt wird eine URL zurückgegeben!
-
+        return url;
     } catch (err) {
-        console.error("❌ TTS speak error:", err);
+        console.error("❌ TTS speakToUrl error:", err);
         return null;
     }
 }
 
 // ------------------------------------------------------------
+// STATIC AUDIO ROUTE FÜR TWILIO
+// Twilio ruft diese URL per GET auf, wir streamen MP3.
+// ------------------------------------------------------------
+app.get("/audio/:id.mp3", (req, res) => {
+    const { id } = req.params;
+    const buffer = audioStore.get(id);
+
+    if (!buffer) {
+        console.error("❌ Audio nicht gefunden:", id);
+        return res.status(404).send("Audio not found");
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", buffer.length);
+    res.send(buffer);
+});
+
+// ------------------------------------------------------------
+// HEALTHCHECK
+// ------------------------------------------------------------
+app.get("/", (_req, res) => {
+    res.send("KLAUDI Voice Agent is running.");
+});
+
+// ------------------------------------------------------------
 // ERSTER ANRUF – BEGRÜßUNG
+// Twilio Phone Number → Voice Webhook (HTTP POST) → /twilio
 // ------------------------------------------------------------
 app.post("/twilio", async (req, res) => {
     const phone = req.body.From;
+    console.log("📲 Eingehender Anruf von:", phone);
+
     const caller = await getOrCreateCaller(phone);
 
-    let greeting = "Hallo, ich bin Klaudi von HOMQ. Wie kann ich dir helfen?";
+    let greeting =
+        "Hallo, ich bin Klaudi von HOMQ. Wie kann ich dir helfen?";
 
     if (caller?.name) {
         greeting = `Hallo ${caller.name}, wie kann ich dir helfen?`;
@@ -122,95 +178,114 @@ app.post("/twilio", async (req, res) => {
         greeting = "Hallo, ich bin Klaudi von HOMQ. Wie darf ich dich nennen?";
     }
 
-    let voice = await speak(greeting);
+    const playUrl = await speakToUrl(greeting);
 
-    if (!voice) {
-        console.error("❌ Konnte Begrüßung nicht generieren");
-        return res.type("text/xml").send(`
-        <Response>
-            <Say voice="alice">Hallo, ich bin Klaudi von HOMQ.</Say>
-            <Redirect>/twilio</Redirect>
-        </Response>`);
+    if (!playUrl) {
+        console.error("❌ Konnte Begrüßung nicht generieren – Fallback <Say>");
+        const fallbackXml = `
+      <Response>
+        <Say voice="alice">Hallo, ich bin Klaudi von HOMQ.</Say>
+        <Record 
+          action="/process"
+          playBeep="false"
+          maxLength="10"
+          trim="trim-silence"
+        />
+      </Response>`;
+
+        console.log("➡️ Sending TwiML (fallback /twilio):", fallbackXml);
+        return res.type("text/xml").send(fallbackXml);
     }
 
     const xml = `
     <Response>
-        <Play>${voice}</Play>
-        <Record 
-            action="/process"
-            playBeep="false"
-            maxLength="10"
-            trim="trim-silence"
-        />
+      <Play>${playUrl}</Play>
+      <Record 
+        action="/process"
+        playBeep="false"
+        maxLength="10"
+        trim="trim-silence"
+      />
     </Response>`;
 
-    console.log("➡️ Sending TwiML (twilio):", xml); // FÜGE DIESE ZEILE HINZU
+    console.log("➡️ Sending TwiML (/twilio):", xml);
     res.type("text/xml").send(xml);
 });
 
 // ------------------------------------------------------------
 // SPRACHAUFSAGE VERARBEITEN
+// Twilio sendet RecordingUrl, wir transkribieren mit OpenAI,
+// sprechen Antwort + spielen sie wieder ab.
 // ------------------------------------------------------------
 app.post("/process", async (req, res) => {
-    try {
+    try, {
         const phone = req.body.From;
-        const audioUrl = req.body.RecordingUrl + ".wav";
+        const recordingUrl = req.body.RecordingUrl; // ohne .wav anhängen
 
-        console.log("🎧 Audio URL:", audioUrl);
+        console.log("🎧 RecordingUrl von Twilio:", recordingUrl);
 
+        // Direktes Transkribieren via file_url (kein Download nötig)
         const transcript = await openai.audio.transcriptions.create({
             model: "gpt-4o-mini-transcribe",
-            file: audioUrl,
-            response_format: "text"
+            file_url: `${recordingUrl}.wav`,
+            response_format: "text",
         });
 
         console.log("📝 Transcript:", transcript);
 
         const caller = await getOrCreateCaller(phone);
 
-        // Name speichern, falls leer & kurz
+        // Name speichern, falls noch leer & kurzer Text
         if (caller && !caller.name && transcript.length < 25) {
             await base44Function("callerUpdate", {
                 id: caller.id,
-                name: transcript.trim()
+                name: transcript.trim(),
             });
         }
 
         const reply = await askKlaudi(caller, transcript);
+        const playUrl = await speakToUrl(reply);
 
-        let voice = await speak(reply);
+        if (!playUrl) {
+            console.error("❌ Konnte Antwort nicht generieren – Fallback <Say>");
+            const fallbackXml = `
+        <Response>
+          <Say voice="alice">
+            Entschuldigung, ich konnte keine Antwort generieren.
+          </Say>s
+          <Redirect>/twilio</Redirect>
+        </Response>`;
 
-        if (!voice) {
-            return res.type("text/xml").send(`
-            <Response>
-                <Say voice="alice">Entschuldigung, ich konnte keine Antwort generieren.</Say>
-                <Redirect>/twilio</Redirect>
-            </Response>`);
+            console.log("➡️ Sending TwiML (fallback /process):", fallbackXml);
+            return res.type("text/xml").send(fallbackXml);
         }
 
         const xml = `
-        <Response>
-            <Play>${voice}</Play>
-            <Redirect>/twilio</Redirect>
-        </Response>`;
+      <Response>
+        <Play>${playUrl}</Play>
+        <Redirect>/twilio</Redirect>
+      </Response>`;
 
-        console.log("➡️ Sending TwiML (process):", xml); // FÜGE DIESE ZEILE HINZU
+        console.log("➡️ Sending TwiML (/process):", xml);
         res.type("text/xml").send(xml);
-
     } catch (err) {
-        console.error("❌ Prozessfehler:", err);
+        console.error("❌ Prozessfehler /process:", err);
 
-        return res.type("text/xml").send(`
-        <Response>
-            <Say voice="alice">Entschuldigung, da ging etwas schief.</Say>
-            <Redirect>/twilio</Redirect>
-        </Response>`);
+        const xml = `
+      <Response>
+        <Say voice="alice">
+          Entschuldigung, da ging etwas schief.
+        </Say>
+        <Redirect>/twilio</Redirect>
+      </Response>`;
+
+        res.type("text/xml").send(xml);
     }
 });
 
 // ------------------------------------------------------------
-// SERVER
+// SERVER STARTEN
 // ------------------------------------------------------------
 app.listen(PORT, () => {
-    console.log(`🚀 KLAUDI 5.1 Voice Agent läuft auf Port ${PORT}`);
+    console.log(`🚀 KLAUDI Voice Agent läuft auf Port ${PORT}`);
 });
