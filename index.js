@@ -6,11 +6,13 @@
 // - Local MP3 hosting for Twilio (no Rauschen)
 //-------------------------------------------------------------
 
+import { Caller } from "./entities.js";
+import { klaudiChat } from "./functions.js";
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import crypto from "crypto";
-import { Caller, klaudiChat } from "./base44/functions.js"; // <– prüfe Pfad
+
 dotenv.config();
 
 const app = express();
